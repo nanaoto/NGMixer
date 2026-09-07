@@ -1,0 +1,8 @@
+{
+  "schema": "rma.mixing-knowledge-catalog/v1",
+  "id": "ngmixer-public-knowledge",
+  "version": "1.0.0",
+  "packs": [
+    { "path": "public-core/manifest.json" }
+  ]
+}

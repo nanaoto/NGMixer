@@ -1,0 +1,55 @@
+{
+  "schema": "rma.mixing-knowledge-manifest/v1",
+  "id": "ngmixer-public-core",
+  "version": "1.0.0",
+  "source": {
+    "kind": "project-authored",
+    "title": "NGMixer Public Mixing Core",
+    "author": "NGMixer contributors",
+    "license": "MIT"
+  },
+  "documents": [
+    {
+      "id": "core-evidence",
+      "path": "00-core-evidence.md",
+      "title": "Evidence-Driven Mixing Loop",
+      "tags": ["evidence", "measurement", "audition", "rollback", "feedback"],
+      "always": true
+    },
+    {
+      "id": "project-editing-routing",
+      "path": "10-project-editing-routing.md",
+      "title": "Project Identity, Editing, and Routing",
+      "tags": ["track", "routing", "send", "bus", "GUID", "project", "identity"],
+      "always": true
+    },
+    {
+      "id": "metering-reference",
+      "path": "20-metering-reference.md",
+      "title": "Metering and Reference Comparison",
+      "tags": ["peak", "RMS", "LUFS", "LRA", "level", "metering", "reference"],
+      "always": false
+    },
+    {
+      "id": "frequency-eq",
+      "path": "30-frequency-eq.md",
+      "title": "Frequency Balance and Equalization",
+      "tags": ["EQ", "frequency", "masking", "air", "mud", "harshness", "vocal"],
+      "always": false
+    },
+    {
+      "id": "dynamics",
+      "path": "40-dynamics.md",
+      "title": "Dynamics and Envelope Shaping",
+      "tags": ["compression", "dynamics", "attack", "release", "ratio", "threshold", "transient"],
+      "always": false
+    },
+    {
+      "id": "space-stereo",
+      "path": "50-space-stereo.md",
+      "title": "Space, Depth, and Stereo Translation",
+      "tags": ["reverb", "delay", "space", "depth", "stereo", "mono", "width"],
+      "always": false
+    }
+  ]
+}

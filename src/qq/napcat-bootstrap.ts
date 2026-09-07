@@ -1,0 +1,465 @@
+import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmod, copyFile, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
+
+import { readRuntimeEnvironment } from "../runtime/environment.js";
+
+const executeFile = promisify(execFile);
+const ffmpegLaunchAgentLabel = "io.reaper-mixing-agent.ffmpeg-bridge";
+
+export interface OneBotBootstrapOptions {
+  readonly token: string;
+  readonly apiPort: number;
+  readonly eventPort: number;
+}
+
+type JsonObject = Record<string, unknown>;
+
+function object(value: unknown, label: string): JsonObject {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return value as JsonObject;
+}
+
+function array(value: unknown, label: string): unknown[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${label} must be a JSON array`);
+  return value;
+}
+
+function replaceNamed(items: unknown[], name: string, replacement: JsonObject): unknown[] {
+  return [...items.filter((item, index) => object(item, `${name} endpoint ${index}`).name !== name), replacement];
+}
+
+export function mergeOneBotConfig(existing: unknown, options: OneBotBootstrapOptions): JsonObject {
+  const root = object(existing, "OneBot config");
+  const network = object(root.network, "OneBot network config");
+  return {
+    ...root,
+    network: {
+      ...network,
+      httpServers: replaceNamed(array(network.httpServers, "OneBot httpServers"), "mixing-agent-api", {
+        name: "mixing-agent-api", enable: true, port: options.apiPort, host: "127.0.0.1",
+        enableCors: false, enableWebsocket: false, messagePostFormat: "array",
+        token: options.token, debug: false,
+      }),
+      httpClients: replaceNamed(array(network.httpClients, "OneBot httpClients"), "mixing-agent-events", {
+        name: "mixing-agent-events", enable: true,
+        url: `http://127.0.0.1:${options.eventPort}/onebot/events`,
+        messagePostFormat: "array", reportSelfMessage: false, token: options.token, debug: false,
+      }),
+      httpSseServers: array(network.httpSseServers, "OneBot httpSseServers"),
+      websocketServers: array(network.websocketServers, "OneBot websocketServers"),
+      websocketClients: array(network.websocketClients, "OneBot websocketClients"),
+      plugins: array(network.plugins, "OneBot plugins"),
+    },
+  };
+}
+
+export function patchNapCatFfmpegBridge(
+  source: string,
+  options: { readonly endpoint: string; readonly tokenFile: string },
+): string {
+  if (source.includes("RMA_AUTHENTICATED_FFMPEG_BRIDGE")) return source;
+  const start = source.indexOf("const Rc = ");
+  const end = source.indexOf("\nfunction jv(", start);
+  if (start < 0 || end < 0) throw new Error("NapCat FFmpeg executor seam was not found; refusing an unsafe patch");
+  const replacement = [
+    "// RMA_AUTHENTICATED_FFMPEG_BRIDGE",
+    "const Rc = async (e, n) => {",
+    "  const { readFile: r } = await import(\"node:fs/promises\");",
+    `  const i = (await r(${JSON.stringify(options.tokenFile)}, "utf8")).trim();`,
+    "  if (i.length < 32) throw new Error(\"FFmpeg bridge token is invalid\");",
+    "  const o = String(e).endsWith(\"ffprobe\") ? \"ffprobe\" : \"ffmpeg\";",
+    `  const s = await fetch(${JSON.stringify(options.endpoint)}, {`,
+    "    method: \"POST\",",
+    "    headers: { \"content-type\": \"application/json\", authorization: `Bearer ${i}` },",
+    "    body: JSON.stringify({ tool: o, args: n })",
+    "  }), a = await s.json();",
+    "  if (!a.ok) {",
+    "    const c = new Error(a.error || `${o} execution failed`);",
+    "    throw c.code = a.code, c.stdout = a.stdout || \"\", c.stderr = a.stderr || \"\", c;",
+    "  }",
+    "  return { stdout: a.stdout || \"\", stderr: a.stderr || \"\" };",
+    "};",
+  ].join("\n");
+  return `${source.slice(0, start)}${replacement}${source.slice(end)}`;
+}
+
+function envValue(value: string): string {
+  if (!/^[A-Za-z0-9_./,:@+\-=]*$/u.test(value)) throw new Error("runtime environment value is not safely serializable");
+  return value;
+}
+
+export function renderRuntimeEnvironment(options: {
+  readonly napCatToken: string;
+  readonly accountId: string;
+  readonly groupId: string;
+  readonly outboundStagingRoot: string;
+  readonly groupIds?: readonly string[];
+  readonly privateUserIds?: readonly string[];
+  readonly providerCredentials?: Readonly<Record<string, string>>;
+}): string {
+  const providerCredentials = Object.entries(options.providerCredentials ?? {}).sort(([left], [right]) =>
+    left.localeCompare(right));
+  for (const [name] of providerCredentials) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) {
+      throw new Error("provider credential name must be an environment variable name");
+    }
+  }
+  return [
+    "# Generated by mixing-agent qq bootstrap-macos. chmod 600; never commit this file.",
+    `NAPCAT_ONEBOT_TOKEN=${envValue(options.napCatToken)}`,
+    "RMA_NAPCAT_URL=http://127.0.0.1:3000",
+    "RMA_NAPCAT_TOKEN_ENV=NAPCAT_ONEBOT_TOKEN",
+    `RMA_QQ_ACCOUNT_ID=${envValue(options.accountId)}`,
+    `RMA_QQ_GROUP_ID=${envValue(options.groupId)}`,
+    `RMA_QQ_GROUP_IDS=${envValue((options.groupIds ?? []).join(","))}`,
+    `RMA_QQ_PRIVATE_USER_IDS=${envValue((options.privateUserIds ?? []).join(","))}`,
+    `RMA_QQ_OUTBOUND_STAGING_ROOT=${envValue(options.outboundStagingRoot)}`,
+    "# Fill this locally. The bootstrap preserves an existing non-empty value.",
+    ...providerCredentials.map(([name, value]) => `${name}=${envValue(value)}`),
+    "",
+  ].join("\n");
+}
+
+function assertQqId(value: string, label: string): string {
+  if (!/^\d{5,12}$/u.test(value)) throw new Error(`${label} must be a 5-12 digit QQ id`);
+  return value;
+}
+
+async function readJson(path: string): Promise<JsonObject> {
+  return object(JSON.parse(await readFile(path, "utf8")) as unknown, path);
+}
+
+async function writePrivate(path: string, contents: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
+  await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 });
+  await chmod(temporary, 0o600);
+  await rename(temporary, path);
+}
+
+async function backupOnce(path: string): Promise<string> {
+  const backup = `${path}.bak-rma-bootstrap`;
+  try {
+    await copyFile(path, backup, 0x1);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  return backup;
+}
+
+async function writeExistingPreservingMetadata(path: string, contents: string): Promise<void> {
+  // QQ's sandbox grants are attached to the existing inode. Replacing it by
+  // rename can drop macOS container metadata and make the file unreadable to QQ.
+  await writeFile(path, contents, "utf8");
+}
+
+async function realExistingParent(path: string): Promise<string> {
+  let candidate = path;
+  for (;;) {
+    try {
+      return await realpath(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) throw error;
+      candidate = parent;
+    }
+  }
+}
+
+function xml(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+export function renderFfmpegLaunchAgent(options: {
+  readonly nodePath: string;
+  readonly scriptPath: string;
+  readonly tokenFile: string;
+  readonly allowedRoot: string;
+  readonly logPath: string;
+  readonly port: number;
+}): string {
+  const environment: Record<string, string> = {
+    RMA_FFMPEG_BRIDGE_AUTOSTART: "1",
+    RMA_FFMPEG_BRIDGE_TOKEN_FILE: options.tokenFile,
+    RMA_FFMPEG_ALLOWED_ROOT: options.allowedRoot,
+    RMA_FFMPEG_BRIDGE_PORT: String(options.port),
+    RMA_FFMPEG_PATH: "/opt/homebrew/bin/ffmpeg",
+    RMA_FFPROBE_PATH: "/opt/homebrew/bin/ffprobe",
+  };
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0"><dict>',
+    '<key>Label</key><string>io.reaper-mixing-agent.ffmpeg-bridge</string>',
+    '<key>ProgramArguments</key><array>',
+    `<string>${xml(options.nodePath)}</string><string>${xml(options.scriptPath)}</string>`,
+    '</array>',
+    '<key>EnvironmentVariables</key><dict>',
+    ...Object.entries(environment).map(([key, value]) => `<key>${key}</key><string>${xml(value)}</string>`),
+    '</dict>',
+    '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>',
+    `<key>StandardOutPath</key><string>${xml(options.logPath)}</string>`,
+    `<key>StandardErrorPath</key><string>${xml(options.logPath)}</string>`,
+    '</dict></plist>',
+    '',
+  ].join("\n");
+}
+
+function renderLoadNapCat(qqPackagePath: string, napCatModulePath: string): string {
+  return [
+    "const loadNapcat = process.argv.includes('--no-sandbox');",
+    `const qqPackage = require(${JSON.stringify(qqPackagePath)});`,
+    "if (loadNapcat) {",
+    `  void import(${JSON.stringify(`file://${napCatModulePath}`)});`,
+    "} else {",
+    `  require(${JSON.stringify(join(dirname(qqPackagePath), "app_launcher", "index.js"))});`,
+    "  setImmediate(() => {",
+    "    if (global.launcher && global.launcher.installPathPkgJson) {",
+    "      global.launcher.installPathPkgJson.main = ((version) => {",
+    "        if (version >= 29271) return './application.asar/app_launcher/index.js';",
+    "        if (version >= 28060) return './application/app_launcher/index.js';",
+    "        return './app_launcher/index.js';",
+    "      })(qqPackage.buildVersion);",
+    "    }",
+    "  });",
+    "}",
+    "",
+  ].join("\n");
+}
+
+export interface NapCatMacosBootstrapOptions {
+  readonly projectRoot: string;
+  readonly accountId: string;
+  readonly groupId?: string;
+  readonly groupIds?: readonly string[];
+  readonly privateUserIds?: readonly string[];
+  readonly providerApiKeyEnvs?: readonly string[];
+  readonly eventPort: number;
+  readonly apiPort?: number;
+  readonly ffmpegBridgePort?: number;
+  readonly runtimeEnvironmentPath?: string;
+  readonly qqAppPath?: string;
+  readonly qqDataRoot?: string;
+  readonly nodePath?: string;
+  readonly launchAgentPath?: string;
+  readonly applicationSupportPath?: string;
+  readonly reloadLaunchAgent?: boolean;
+}
+
+export interface NapCatMacosBootstrapReport {
+  readonly runtimeEnvironmentPath: string;
+  readonly oneBotConfigPath?: string;
+  readonly launchAgentPath: string;
+  readonly backups: readonly string[];
+}
+
+async function reloadFfmpegLaunchAgent(launchAgentPath: string): Promise<void> {
+  const domain = `gui/${process.getuid?.() ?? 501}`;
+  try {
+    await executeFile("/bin/launchctl", ["bootout", `${domain}/${ffmpegLaunchAgentLabel}`]);
+  } catch {
+    // A missing prior service is the expected first-install state.
+  }
+  await executeFile("/bin/launchctl", ["bootstrap", domain, launchAgentPath]);
+}
+
+export async function installFfmpegBridgeMacos(options: {
+  readonly projectRoot: string;
+  readonly qqDataRoot?: string;
+  readonly nodePath?: string;
+  readonly launchAgentPath?: string;
+  readonly applicationSupportPath?: string;
+  readonly ffmpegBridgePort?: number;
+  readonly reloadLaunchAgent?: boolean;
+}): Promise<{ launchAgentPath: string; napCatBackup: string }> {
+  if (process.platform !== "darwin") throw new Error("FFmpeg bridge installer only supports macOS");
+  const qqDataRoot = options.qqDataRoot ?? join(homedir(), "Library/Containers/com.tencent.qq/Data");
+  const napCatModulePath = join(qqDataRoot, "Documents/napcat/napcat.mjs");
+  const napCatTokenFile = join(qqDataRoot, "Documents/napcat/ffmpeg-bridge.token");
+  const appSupport = options.applicationSupportPath ??
+    join(homedir(), "Library/Application Support/ReaperMixingAgent");
+  const bridgeTokenFile = join(appSupport, "ffmpeg-bridge.token");
+  const stableBridgePath = join(appSupport, "ffmpeg-bridge.mjs");
+  const launchAgentPath = options.launchAgentPath ??
+    join(homedir(), `Library/LaunchAgents/${ffmpegLaunchAgentLabel}.plist`);
+  const [napCatSource, bridgeSource] = await Promise.all([
+    readFile(napCatModulePath, "utf8"),
+    readFile(join(options.projectRoot, "dist/qq/ffmpeg-bridge.js"), "utf8"),
+  ]);
+  const patchedNapCat = patchNapCatFfmpegBridge(napCatSource, {
+    endpoint: `http://127.0.0.1:${options.ffmpegBridgePort ?? 32281}/exec`,
+    tokenFile: napCatTokenFile,
+  });
+  const token = randomBytes(32).toString("base64url");
+  const launchAgent = renderFfmpegLaunchAgent({
+    nodePath: options.nodePath ?? "/opt/homebrew/bin/node",
+    scriptPath: stableBridgePath,
+    tokenFile: bridgeTokenFile,
+    allowedRoot: qqDataRoot,
+    logPath: join(appSupport, "ffmpeg-bridge.log"),
+    port: options.ffmpegBridgePort ?? 32281,
+  });
+  const napCatBackup = await backupOnce(napCatModulePath);
+  await writePrivate(napCatTokenFile, `${token}\n`);
+  await writePrivate(bridgeTokenFile, `${token}\n`);
+  await writeExistingPreservingMetadata(napCatModulePath, patchedNapCat);
+  await writePrivate(stableBridgePath, bridgeSource);
+  await writePrivate(launchAgentPath, launchAgent);
+  if (options.reloadLaunchAgent ?? true) await reloadFfmpegLaunchAgent(launchAgentPath);
+  return { launchAgentPath, napCatBackup };
+}
+
+export async function bootstrapNapCatMacos(
+  options: NapCatMacosBootstrapOptions,
+): Promise<NapCatMacosBootstrapReport> {
+  if (process.platform !== "darwin") throw new Error("NapCat macOS bootstrap only supports macOS");
+  const accountId = assertQqId(options.accountId, "QQ account id");
+  const groupId = options.groupId === undefined ? undefined : assertQqId(options.groupId, "QQ group id");
+  const groupIds = (options.groupIds ?? []).map((id) => assertQqId(id, "extra QQ group id"));
+  const privateUserIds = (options.privateUserIds ?? []).map((id) => assertQqId(id, "private QQ user id"));
+  if (!groupId && (groupIds.length > 0 || privateUserIds.length > 0)) {
+    throw new Error("QQ group and private scopes require a default QQ group id");
+  }
+  const qqAppPath = options.qqAppPath ?? "/Applications/QQ.app";
+  const qqDataRoot = options.qqDataRoot ?? join(homedir(), "Library/Containers/com.tencent.qq/Data");
+  const napCatDocuments = join(qqDataRoot, "Documents", "napcat");
+  const napCatModulePath = join(napCatDocuments, "napcat.mjs");
+  const loadNapCatPath = join(qqDataRoot, "Documents", "loadNapCat.js");
+  const qqPackagePath = join(qqAppPath, "Contents", "Resources", "app", "package.json");
+  const oneBotConfigPath = join(
+    qqDataRoot,
+    "Library/Application Support/QQ/NapCat/config",
+    `onebot11_${accountId}.json`,
+  );
+  const napCatConfigPath = join(dirname(oneBotConfigPath), `napcat_${accountId}.json`);
+  const runtimeEnvironmentPath = options.runtimeEnvironmentPath ??
+    join(homedir(), ".config/reaper-mixing-agent/runtime.env");
+  if (!isAbsolute(runtimeEnvironmentPath)) throw new Error("runtime environment path must be absolute");
+  const [realProjectRoot, realEnvironmentParent] = await Promise.all([
+    realpath(resolve(options.projectRoot)),
+    realExistingParent(dirname(resolve(runtimeEnvironmentPath))),
+  ]);
+  const environmentRelation = relative(realProjectRoot, realEnvironmentParent);
+  if (!environmentRelation.startsWith("..") && !isAbsolute(environmentRelation)) {
+    throw new Error("runtime environment must not be stored inside the project repository");
+  }
+  const appSupport = options.applicationSupportPath ??
+    join(homedir(), "Library/Application Support/ReaperMixingAgent");
+  const stableBridgePath = join(appSupport, "ffmpeg-bridge.mjs");
+  const launchAgentPath = options.launchAgentPath ??
+    join(homedir(), "Library/LaunchAgents/io.reaper-mixing-agent.ffmpeg-bridge.plist");
+  const napCatFfmpegTokenFile = join(napCatDocuments, "ffmpeg-bridge.token");
+  const bridgeTokenFile = join(appSupport, "ffmpeg-bridge.token");
+  const backups: string[] = [];
+
+  let currentEnvironment: Record<string, string> = {};
+  if (groupId) {
+    try {
+      currentEnvironment = await readRuntimeEnvironment(runtimeEnvironmentPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  const oneBotToken = currentEnvironment.NAPCAT_ONEBOT_TOKEN || randomBytes(32).toString("base64url");
+  let ffmpegToken: string;
+  try {
+    ffmpegToken = (await readFile(bridgeTokenFile, "utf8")).trim();
+    if (ffmpegToken.length < 32) throw new Error("existing FFmpeg bridge token is invalid");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    ffmpegToken = randomBytes(32).toString("base64url");
+  }
+  // Preflight every upstream seam and compute every output before the first write.
+  const [
+    realQqPackagePath,
+    realLoadNapCatPath,
+    realNapCatModulePath,
+    existingOneBot,
+    napCatConfig,
+    napCatSource,
+    qqPackage,
+    bridgeSource,
+  ] = await Promise.all([
+    realpath(qqPackagePath),
+    realpath(loadNapCatPath),
+    realpath(napCatModulePath),
+    groupId ? readJson(oneBotConfigPath) : Promise.resolve(undefined),
+    readJson(napCatConfigPath),
+    readFile(napCatModulePath, "utf8"),
+    readJson(qqPackagePath),
+    readFile(join(options.projectRoot, "dist", "qq", "ffmpeg-bridge.js"), "utf8"),
+    readFile(loadNapCatPath, "utf8"),
+  ]);
+  if ((typeof qqPackage.buildVersion !== "string" && typeof qqPackage.buildVersion !== "number") ||
+      typeof qqPackage.main !== "string") {
+    throw new Error("QQ package structure is not recognized; refusing to patch");
+  }
+  const nextOneBot = groupId && existingOneBot ? `${JSON.stringify(mergeOneBotConfig(existingOneBot, {
+    token: oneBotToken, apiPort: options.apiPort ?? 3000, eventPort: options.eventPort,
+  }), null, 2)}\n` : undefined;
+  const nextNapCatConfig = `${JSON.stringify({ ...napCatConfig, packetBackend: "disable" }, null, 2)}\n`;
+  const patchedNapCat = patchNapCatFfmpegBridge(napCatSource, {
+    endpoint: `http://127.0.0.1:${options.ffmpegBridgePort ?? 32281}/exec`,
+    tokenFile: napCatFfmpegTokenFile,
+  });
+  let loaderPath = relative(dirname(realQqPackagePath), realLoadNapCatPath);
+  if (!loaderPath.startsWith(".")) loaderPath = `./${loaderPath}`;
+  const nextQqPackage = `${JSON.stringify({ ...qqPackage, main: loaderPath }, null, 2)}\n`;
+  const nextLoader = renderLoadNapCat(realQqPackagePath, realNapCatModulePath);
+  const nextEnvironment = groupId ? renderRuntimeEnvironment({
+    napCatToken: oneBotToken,
+    accountId,
+    groupId,
+    groupIds,
+    privateUserIds,
+    outboundStagingRoot: join(napCatDocuments, "rma-outbound"),
+    providerCredentials: Object.fromEntries((options.providerApiKeyEnvs ?? []).map((name) => [
+      name,
+      currentEnvironment[name] ?? "",
+    ])),
+  }) : undefined;
+  const launchAgent = renderFfmpegLaunchAgent({
+    nodePath: options.nodePath ?? "/opt/homebrew/bin/node",
+    scriptPath: stableBridgePath,
+    tokenFile: bridgeTokenFile,
+    allowedRoot: qqDataRoot,
+    logPath: join(appSupport, "ffmpeg-bridge.log"),
+    port: options.ffmpegBridgePort ?? 32281,
+  });
+
+  backups.push(await backupOnce(napCatModulePath));
+  backups.push(await backupOnce(loadNapCatPath));
+  backups.push(await backupOnce(qqPackagePath));
+  await writePrivate(napCatFfmpegTokenFile, `${ffmpegToken}\n`);
+  await writePrivate(bridgeTokenFile, `${ffmpegToken}\n`);
+  if (nextOneBot) {
+    await writeExistingPreservingMetadata(oneBotConfigPath, nextOneBot);
+    await chmod(oneBotConfigPath, 0o600);
+  }
+  await writeExistingPreservingMetadata(napCatConfigPath, nextNapCatConfig);
+  await chmod(napCatConfigPath, 0o600);
+  await writeExistingPreservingMetadata(napCatModulePath, patchedNapCat);
+  await writeExistingPreservingMetadata(loadNapCatPath, nextLoader);
+  await writeExistingPreservingMetadata(qqPackagePath, nextQqPackage);
+  if (nextEnvironment) await writePrivate(runtimeEnvironmentPath, nextEnvironment);
+  await mkdir(appSupport, { recursive: true });
+  await writePrivate(stableBridgePath, bridgeSource);
+  await writePrivate(launchAgentPath, launchAgent);
+  if (options.reloadLaunchAgent ?? true) {
+    await reloadFfmpegLaunchAgent(launchAgentPath);
+  }
+  return {
+    runtimeEnvironmentPath,
+    ...(groupId ? { oneBotConfigPath } : {}),
+    launchAgentPath,
+    backups,
+  };
+}

@@ -1,0 +1,55 @@
+# Advanced manual configuration. The first-run wizard generates config/local.toml.
+# For WebUI-managed models, omit every [llm.*] section below and configure
+# providers, credentials, and the default model in Settings > Models.
+# For manual models, set the named API key environment variables before launch.
+
+[paths]
+reaper_executable = "/path/to/REAPER"
+ffmpeg_executable = "/path/to/ffmpeg"
+reaper_resource_path = "/path/to/reaper-resource"
+runtime_root = "/path/to/private/runtime"
+audio_work_root = "/path/to/private/audio"
+
+[network]
+daemon_host = "127.0.0.1"
+daemon_port = 32180
+dsh_host = "127.0.0.1"
+dsh_port = 3080
+
+[llm.default]
+provider = "primary"
+model = "replace-with-model-id"
+fallbacks = [{ provider = "backup", model = "replace-with-model-id" }]
+
+[llm.mix_planner]
+provider = "primary"
+model = "replace-with-model-id"
+fallbacks = [{ provider = "backup", model = "replace-with-model-id" }]
+
+[llm.providers.primary]
+display_name = "Primary Gateway"
+api = "openai-completions"
+base_url = "https://provider.example/v1"
+api_key_env = "REAPER_MIXING_AGENT_API_KEY"
+
+[[llm.providers.primary.models]]
+id = "replace-with-model-id"
+
+[llm.providers.backup]
+display_name = "Backup Gateway"
+api = "openai-completions"
+base_url = "https://backup-provider.example/v1"
+api_key_env = "REAPER_MIXING_AGENT_BACKUP_API_KEY"
+
+[[llm.providers.backup.models]]
+id = "replace-with-model-id"
+
+[reaper]
+poll_interval_ms = 100
+command_timeout_ms = 30000
+render_timeout_ms = 300000
+
+[safety]
+allow_network_audio_upload = false
+allow_source_media_write = false
+allow_gui_coordinate_control = false
