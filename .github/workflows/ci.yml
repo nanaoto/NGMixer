@@ -9,7 +9,8 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # DSH integration tests load dsh-computer-use, which requires macOS.
+    runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
