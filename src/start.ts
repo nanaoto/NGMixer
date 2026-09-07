@@ -16,7 +16,7 @@ async function main(): Promise<number> {
     ...(process.stdin.isTTY && process.stdout.isTTY ? { prompter: createTerminalPrompter() } : {}),
   });
   if (firstRun.configured) {
-    console.log(`首次配置完成。请在 REAPER Actions 中运行：${firstRun.bridgeLauncherPath}`);
+    console.log("首次配置完成，REAPER 桥接脚本已准备好。请在对话中提供素材和混音要求。");
     console.log(firstRun.channel === "qq"
       ? "QQ 通道已配置；DSH WebUI 也会同时启动。"
       : "未配置外部消息通道，正在启动本地 DSH WebUI。");

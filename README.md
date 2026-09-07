@@ -14,7 +14,7 @@
 
 [English](./README.en.md)
 
-告诉 NGMixer 你想怎么改，它会读取当前工程、分析音量与响度，调整轨道和效果器，再渲染音频供你试听。混音师解放双手变甲方，最扬眉吐气的一集。
+把素材和混音要求交给 NGMixer，它会准备工程、分析音量与响度，调整轨道和效果器，再渲染音频供你试听。混音师解放双手变甲方，最扬眉吐气的一集。
 
 > “主唱再靠前一点，混响少一些，导出一版试听。”
 >
@@ -41,7 +41,7 @@
 
 | 依赖 | 要求 |
 | --- | --- |
-| [REAPER](https://www.reaper.fm/download.php) | 7.x |
+| [REAPER](https://www.reaper.fm/download.php) | 7.x，安装后至少打开过一次 |
 | Node.js | `>=22.19 <23` |
 | Corepack / pnpm | 使用仓库指定的 pnpm 版本 |
 | 模型服务 | DSH 支持的模型供应商及其凭据 |
@@ -62,24 +62,13 @@ pnpm start
 
 本机配置保存在 `config/local.toml`。网页打开后，按下方[配置 LLM API](#配置-llm-api)选择供应商、填写密钥并设置默认模型。后续启动仍使用 `pnpm start`。
 
-### 3. 连接 REAPER
+### 3. 提供素材，开始混音
 
-打开 REAPER，在动作列表中加载配置向导生成的 `StartMixingAgentBridge.lua`，具体路径会显示在终端中：
+打开终端显示的 WebUI 地址，默认为 `http://127.0.0.1:3080`。在对话中提供音频素材、REAPER 工程或素材所在的本机路径，并描述你想要的效果。例如：
 
-`Actions → Show action list → New action… → Load ReaScript…`
+> 用这个文件夹里的人声和伴奏建一个工程，把主唱混得靠前一点，然后导出 WAV 试听。
 
-选中并运行该脚本，然后在另一个终端中检查连接：
-
-```bash
-pnpm bridge:health
-pnpm bridge:snapshot
-```
-
-### 4. 开始混音
-
-在 REAPER 中打开工程，再打开终端显示的 WebUI 地址，默认为 `http://127.0.0.1:3080`。试着发送：
-
-> 分析一下当前工程，把主唱调得靠前一点，然后导出 WAV 试听。
+REAPER 只需在安装后由你打开过一次。后续工程准备和脚本调用交给 NGMixer，无需手动打开工程或在动作列表中加载 Lua。
 
 听完后，直接在对话中描述下一步想改的地方。
 
@@ -125,7 +114,7 @@ pnpm bridge:snapshot
 | `pnpm bridge:health` | 检查 REAPER 桥接连接 |
 | `pnpm bridge:snapshot` | 查看当前工程的轨道和效果器 |
 
-桥接请求超时时，先确认 REAPER 已打开，并在动作列表中运行 `StartMixingAgentBridge.lua`。模型请求失败时，到 **设置 → 模型** 检查供应商凭据和默认模型；使用中转服务时同时核对接口地址、协议和模型 ID。
+桥接请求超时时，运行 `pnpm doctor` 检查 REAPER 路径和本机配置，再将报错交给 NGMixer 排查连接。模型请求失败时，到 **设置 → 模型** 检查供应商凭据和默认模型；使用中转服务时同时核对接口地址、协议和模型 ID。
 
 更新代码后，运行 `pnpm install --frozen-lockfile`，再运行 `pnpm start`。本机路径、模型设置和密钥会继续保留。
 
